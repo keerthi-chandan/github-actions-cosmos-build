@@ -1,0 +1,21 @@
+# Local-only docs (per portfolio convention; only architecture + procedure go public)
+docs/tutorial.md
+docs/purposes.md
+
+# Build artifacts
+noble/
+*.sarif
+trivy-*.json
+*.tar.gz
+nobled
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Secrets — never commit
+.env
+.env.*
+*.pem
+*.key

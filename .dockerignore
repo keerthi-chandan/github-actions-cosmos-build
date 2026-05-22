@@ -1,0 +1,10 @@
+.github/
+docs/
+examples/
+scripts/
+*.md
+.gitignore
+.git/
+noble/
+*.sarif
+trivy-*.json
