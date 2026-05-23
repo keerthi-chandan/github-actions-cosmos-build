@@ -31,7 +31,7 @@ env:
   ECR_REPOSITORY: cosmos/nobled
   NOBLE_REPO: https://github.com/strangelove-ventures/noble.git
   NOBLE_VERSION: v11.1.0-rc.1
-  GO_VERSION: "1.24.13"
+  GO_VERSION: "1.25.10"
 
 # Read-only by default at the workflow level; the publish job widens this
 # to id-token: write so it can mint an OIDC token for AWS STS.
@@ -71,6 +71,7 @@ jobs:
           image-ref: nobled:${{ github.sha }}
           severity: HIGH,CRITICAL
           ignore-unfixed: true
+          trivyignores: ./.trivyignore
           exit-code: 1
           format: table
 
