@@ -1,4 +1,4 @@
-name: nobled CI/CD
+name: nobled CI
 
 # Triggers
 #   - push: builds run on main and the integration branch
