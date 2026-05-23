@@ -45,55 +45,51 @@ concurrency:
 
 jobs:
   build:
-    name: Build nobled binary
+    name: Build Docker image & scan
     runs-on: ubuntu-latest
     steps:
       - name: Code checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Clone Noble source
+      - name: Build image
         run: |
-          rm -rf noble
-          git clone --depth 1 --branch "${NOBLE_VERSION}" "${NOBLE_REPO}" noble
+          docker buildx build --load \
+            -f docker/Dockerfile \
+            --build-arg NOBLE_REPO="${NOBLE_REPO}" \
+            --build-arg NOBLE_VERSION="${NOBLE_VERSION}" \
+            -t nobled:${{ github.sha }} \
+            .
 
-      - name: Cache Go modules and build cache
-        uses: actions/cache@v4
+      # Image-level CVE gate. Runs before save/upload so a failed scan
+      # means no artifact is produced and publish can never run.
+      - name: Trivy image scan (gate)
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ env.GO_VERSION }}-${{ hashFiles('noble/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-${{ env.GO_VERSION }}-
+          image-ref: nobled:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          exit-code: 1
+          format: table
 
-      - name: Build nobled
-        working-directory: noble
-        run: |
-          make install
-          "${HOME}/go/bin/nobled" version
+      - name: Save image to tarball
+        run: docker save nobled:${{ github.sha }} | gzip > nobled-image.tar.gz
 
-      - name: Upload nobled binary
+      - name: Upload image artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nobled-${{ github.sha }}
-          path: ~/go/bin/nobled
+          name: nobled-image-${{ github.sha }}
+          path: nobled-image.tar.gz
           retention-days: 7
 
-      - name: Notify if Build Fails
+      - name: Notify if build fails
         if: failure()
-        run: echo "::error::Build job failed — check logs above"
+        run: echo "::error::Build/scan job failed — check logs above"
 
   test:
     name: Go unit tests
     runs-on: ubuntu-latest
-    needs: build
     steps:
       - name: Code checkout
         uses: actions/checkout@v4
@@ -130,7 +126,6 @@ jobs:
   lint:
     name: golangci-lint
     runs-on: ubuntu-latest
-    needs: build
     steps:
       - name: Code checkout
         uses: actions/checkout@v4
@@ -153,7 +148,6 @@ jobs:
   gosec:
     name: gosec security scan
     runs-on: ubuntu-latest
-    needs: build
     steps:
       - name: Code checkout
         uses: actions/checkout@v4
@@ -176,7 +170,6 @@ jobs:
   trivy_fs:
     name: Trivy filesystem scan
     runs-on: ubuntu-latest
-    needs: build
     steps:
       - name: Code checkout
         uses: actions/checkout@v4
@@ -198,7 +191,7 @@ jobs:
           path: trivy-fs-results.json
 
   publish:
-    name: Build image & push to ECR
+    name: Push to ECR
     runs-on: ubuntu-latest
     needs: [build, test, lint, gosec, trivy_fs]
     # Gate on main + push/schedule/dispatch — PRs run CI but never push.
@@ -208,10 +201,13 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - name: Code checkout
-        uses: actions/checkout@v4
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
         with:
-          fetch-depth: 0
+          name: nobled-image-${{ github.sha }}
+
+      - name: Load image into Docker
+        run: gunzip -c nobled-image.tar.gz | docker load
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
@@ -224,33 +220,15 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build & push image
-        id: build-image
+      - name: Tag and push to ECR
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build \
-            -f docker/Dockerfile \
-            --build-arg NOBLE_REPO="${NOBLE_REPO}" \
-            --build-arg NOBLE_VERSION="${NOBLE_VERSION}" \
-            -t "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" \
-            -t "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest" \
-            .
+          docker tag nobled:${{ github.sha }} "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          docker tag nobled:${{ github.sha }} "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
           docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
           docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
-          echo "image=${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
-
-      - name: Trivy image scan (post-push, report-only)
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: ${{ steps.build-image.outputs.image }}
-          severity: HIGH,CRITICAL
-          exit-code: 0
-          format: table
 
   notify:
     name: Slack notify
