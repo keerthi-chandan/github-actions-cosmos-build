@@ -23,15 +23,17 @@ Sections:
 
 ## 1. Prereqs
 
-Tools (you already have these from jenkins-cosmos-build):
+Tools you need:
 
 - `git` (terminal)
 - A web browser logged into your GitHub account `keerthi-chandan`
-- A web browser logged into the AWS Console for account `720294271237` (the same account that hosts the `cosmos/nobled` ECR repo from jenkins-cosmos-build)
+- A web browser logged into the AWS Console for account `720294271237` (the account that hosts the `cosmos/nobled` ECR repo and will host the ECS resources)
 
 You do **not** need: `gh` CLI, `aws` CLI, anything else — the UI handles it all.
 
 Local scaffold at `~/Desktop/devops/github-actions-cosmos-build/` is already in place.
+
+The CI workflow pushes images to ECR repo `cosmos/nobled`. The CD workflow (step 9) rolls those images out to an ECS Fargate service that this procedure walks through creating in §9.1–9.5. No dependency on any other pipeline — this repo is self-contained.
 
 ## 2. Create the GitHub repo
 
@@ -247,19 +249,115 @@ Option B — manual trigger via UI:
 
 ## 9. Verify the CD workflow (auto-deploy + manual rollback)
 
-`.github/workflows/noble-cd.yml` is a second workflow file that handles the ECS Fargate rollout — the same deploy step that lived as the final stage of the jenkins-cosmos-build pipeline. It runs as a *downstream* workflow that fires after `nobled CI/CD` succeeds, so CI and CD are independently retriggerable.
+`.github/workflows/noble-cd.yml` is a second workflow file that handles the ECS Fargate rollout. It runs as a *downstream* workflow that fires after `nobled CI/CD` succeeds, so CI and CD are independently retriggerable.
 
-### Prereqs from jenkins-cosmos-build
+The CD workflow only *updates* an existing ECS service — it does not create the cluster, service, or task definition. §9.1–9.5 below walk through creating those resources in the console one time. After that, the workflow takes over.
 
-These ECS resources are assumed to already exist (you created them as part of jenkins-cosmos-build):
+If you happen to already have these resources from another lab (e.g., the jenkins-cosmos-build portfolio repo uses the same names), you can skip §9.1–9.5 — the resource names match by design so a single ECS environment serves both pipelines. Otherwise, do every sub-step.
 
-- **ECS cluster**: `nobled-cluster`
-- **ECS service**: `nobled-smoke-service` (running task definition family `nobled-smoke`)
-- **Task execution role**: `ecsTaskExecutionRole`
+You also need the inline IAM policy you attached in step 5 sub-steps 17-19 (`github-actions-nobled-cd-ecs`). Without it, the deploy job fails on `ecs:DescribeTaskDefinition` with `AccessDenied`.
 
-If you tore those down, recreate them from the jenkins-cosmos-build procedure before continuing. The CD workflow only *updates* the existing service — it does not create the cluster, service, or task definition.
+### 9.1 — CloudWatch log group (~2 min)
 
-You also need the inline IAM policy you attached in step 5 sub-steps 17-19. Without it, the deploy job fails on `ecs:DescribeTaskDefinition` with `AccessDenied`.
+The task definition refuses to register if the log group it references doesn't exist yet, so this comes first.
+
+1. AWS Console → search **CloudWatch** → click the service.
+2. Left sidebar → **Log groups** → click **Create log group** (top right).
+3. **Log group name**: `/ecs/nobled-smoke`.
+4. **Retention setting**: `1 week` (cheap; we don't need forever).
+5. Click **Create**.
+
+### 9.2 — ECS task execution role (~3 min)
+
+This role is what Fargate uses to pull from ECR and write to CloudWatch *before* your container starts. It is separate from the OIDC role from step 5 (which is what the GitHub Actions runner assumes).
+
+1. AWS Console → IAM → **Roles** (left sidebar).
+2. Click **Create role** (top right).
+3. **Trusted entity type**: **AWS service**.
+4. **Use case**: **Elastic Container Service** → select **Elastic Container Service Task** (NOT "EC2 Container Service") → click **Next**.
+5. **Permissions policies**: in the search box, type `AmazonECSTaskExecutionRolePolicy` and check it → **Next**.
+6. **Role name**: `ecsTaskExecutionRole` — use this exact name. The inline policy you attached in step 5.18 has `iam:PassRole` scoped to this exact ARN; renaming it will silently break the deploy job.
+7. **Description** (optional): `Fargate execution role — pulls from ECR + writes CloudWatch logs`.
+8. Scroll down → **Create role**.
+
+### 9.3 — ECS cluster (~2 min)
+
+A cluster is just a named bucket for services and tasks — no compute is reserved upfront on Fargate.
+
+1. AWS Console → search **ECS** → click Elastic Container Service.
+2. Left sidebar → **Clusters** → **Create cluster** (top right).
+3. **Cluster name**: `nobled-cluster`.
+4. **Infrastructure**: leave **AWS Fargate (serverless)** checked. Uncheck "Amazon EC2 instances" if it's on.
+5. **Monitoring / Tags**: skip.
+6. Click **Create**. Takes ~1 min.
+
+### 9.4 — Task definition, revision 1 (~5 min)
+
+This is the blueprint Fargate uses to launch a container. The CD workflow patches the image field and registers a new revision on every deploy, but revision 1 has to be created in the console once.
+
+1. Still in ECS → **Task definitions** (left sidebar) → **Create new task definition** (top right). Pick the standard wizard, not the JSON editor.
+2. **Task definition family**: `nobled-smoke`.
+3. **Infrastructure requirements**:
+    - Launch type: **AWS Fargate**
+    - Operating system / Architecture: **Linux/X86_64**
+    - CPU: `0.25 vCPU`
+    - Memory: `0.5 GB`
+    - Task role: leave blank (`None`) — the smoke-test container needs no AWS perms.
+    - Task execution role: **`ecsTaskExecutionRole`** (the one from §9.2).
+4. **Container — 1**:
+    - Name: `nobled`
+    - Image URI: `720294271237.dkr.ecr.us-east-1.amazonaws.com/cosmos/nobled:latest` (bootstrap with `:latest` — the CD workflow rewrites this on every deploy)
+    - Essential container: **Yes**
+    - Port mappings: leave empty (smoke test exposes nothing)
+5. Expand **Docker configuration**:
+    - **Entry point**: `sh,-c`
+    - **Command**: `nobled version && sleep 3600`
+
+    ⚠️ **Landmine**: the Dockerfile sets `ENTRYPOINT ["nobled"]` + `CMD ["start"]`. If you override only **Command**, the final invocation becomes `nobled sh -c "nobled version && sleep 3600"` — broken. You **must** override both Entry point and Command. After saving, reopen the task def and confirm both fields stuck — the console UI here is finicky.
+
+6. Expand **Logging** → enable **Use log collection** → **CloudWatch**:
+    - Log group: select `/ecs/nobled-smoke` (must exist from §9.1)
+    - Region: `us-east-1`
+    - Stream prefix: `nobled`
+7. Health check / environment vars / secrets: skip.
+8. Scroll down → **Create**. You should now have `nobled-smoke:1`.
+
+### 9.5 — ECS service (~5 min)
+
+The service is the long-running supervisor that keeps the desired count of tasks alive and is what the CD workflow's `UpdateService` call targets.
+
+1. ECS → Clusters → click `nobled-cluster` → **Services** tab → click **Create**.
+2. **Environment**:
+    - Compute options: **Launch type**
+    - Launch type: **Fargate**
+    - Platform version: `LATEST`
+3. **Deployment configuration**:
+    - Application type: **Service**
+    - Family: `nobled-smoke`
+    - Revision: `1` (latest)
+    - Service name: `nobled-smoke-service`
+    - Desired tasks: `1`
+4. **Networking**:
+    - VPC: default
+    - Subnets: pick the **2 default public subnets** (us-east-1a and us-east-1b)
+    - Security group: choose **Create a new security group**, name it `nobled-smoke-sg`, leave **no inbound rules**, and accept the default outbound rule (all traffic out — needed to reach ECR's public endpoint).
+    - Public IP: **TURNED ON** ⚠️ if this is off, Fargate can't reach ECR; the task gets stuck `PROVISIONING → STOPPED` with `CannotPullContainerError`. Easiest mistake in this whole phase.
+5. **Load balancing**: None.
+6. **Service auto scaling**: off.
+7. Scroll down → **Create**. Takes ~1–2 min.
+
+**Verify the bootstrap task runs**: after ~2 min, the service should report `Running tasks: 1`. Open the **Tasks** tab → click the task → **Logs** tab. You should see Noble's version banner:
+
+```
+name: nobled
+version: v11.4.0
+commit: ...
+go: go version go1.25.X linux/amd64
+```
+
+The container then sleeps 3600s, exits 0, and ECS restarts it. Looping forever is expected.
+
+If the task gets stuck in PROVISIONING or fails to pull the image, double-check the public IP toggle on the service and that the ECR repo `cosmos/nobled` actually has an image (step 8 should have pushed `:latest`).
 
 ### Watch the auto-deploy
 
@@ -438,6 +536,19 @@ If you want to fully clean up the AWS side of this lab (the GitHub repo itself c
 1. AWS Console → IAM → Roles.
 2. Search for `github-actions-nobled-ci` and check the checkbox.
 3. Click **Delete** (top right) → type the role name to confirm → **Delete**.
+
+### Delete the ECS resources (UI, only if you created them in §9)
+
+Order matters — you can't delete a cluster while it still has services, and you can't delete a task definition family while a revision is `ACTIVE`. Walk through in this order:
+
+1. **Scale the service to 0** so no Fargate tasks keep running while you tear down:
+    - ECS → Clusters → `nobled-cluster` → Services tab → `nobled-smoke-service` → **Update service** → Desired tasks: `0` → **Update**.
+2. **Delete the service**: same service page → **Delete service** (top right) → check **Force delete** → type `delete` to confirm.
+3. **Deregister the task definition revisions**: ECS → Task definitions → click `nobled-smoke` → select all revisions → **Actions** → **Deregister**. (You can't outright delete revisions; deregistered is fine and free.)
+4. **Delete the cluster**: ECS → Clusters → check `nobled-cluster` → **Delete cluster** → type the cluster name to confirm.
+5. **Delete the security group**: EC2 → Security groups → check `nobled-smoke-sg` → **Actions** → **Delete security groups**. (If it complains about dependencies, wait ~1 min after deleting the service for the ENI to free up.)
+6. **Delete the execution role**: IAM → Roles → `ecsTaskExecutionRole` → **Delete** → confirm. Skip this step if any other lab in the account uses this role — the name is generic.
+7. **Delete the log group**: CloudWatch → Log groups → check `/ecs/nobled-smoke` → **Actions** → **Delete log group(s)**.
 
 ### Delete the legacy IAM user (UI, only if you did step 13)
 
