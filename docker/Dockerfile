@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1.7
 
 # ---- Build stage ----
-FROM golang:1.25.10-bookworm AS builder
+FROM golang:1.24.13-bookworm AS builder
 
 ARG NOBLE_REPO=https://github.com/strangelove-ventures/noble.git
-ARG NOBLE_VERSION=v11.1.0-rc.1
+ARG NOBLE_VERSION=v11.4.0
 
 RUN apt-get update \
     && apt-get upgrade -y \
