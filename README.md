@@ -1,32 +1,34 @@
 # github-actions-cosmos-build
 
-GitHub Actions CI/CD for the [Noble](https://github.com/strangelove-ventures/noble) Cosmos testnet node — sibling of [jenkins-cosmos-build](https://github.com/keerthi-chandan/jenkins-cosmos-build).
+GitHub Actions CI/CD for the [Noble](https://github.com/strangelove-ventures/noble) Cosmos mainnet node — sibling of [jenkins-cosmos-build](https://github.com/keerthi-chandan/jenkins-cosmos-build).
 
-Same Noble `grand-1` testnet node, same multistage Dockerfile, same AWS ECR target — different CI tool. Where the Jenkins repo provisions an EC2 controller + agent and hand-wires SSH credentials, this repo runs on GitHub-hosted ephemeral runners and authenticates to AWS via OIDC (no long-lived keys).
+Builds Noble mainnet (`noble-1`, currently pinned to `v11.4.0`) on the same multistage Dockerfile pattern as the Jenkins repo, with the same AWS ECR target — different CI tool. Where the Jenkins repo provisions an EC2 controller + agent and hand-wires SSH credentials, this repo runs on GitHub-hosted ephemeral runners and authenticates to AWS via OIDC (no long-lived keys).
 
 ## Pipeline at a glance
 
 ```
 push / PR / workflow_dispatch / nightly cron
                 │
-                ▼
-         ┌──────────────┐
-         │    build     │  setup-go → clone noble → make install → upload nobled artifact
-         └──────┬───────┘
-                │
-   ┌────────┬───┴────┬──────────┐
-   ▼        ▼        ▼          ▼
-  test    lint    gosec    trivy_fs        (parallel; all needs: build)
-   └────────┴────┬───┴──────────┘
+   ┌─────────┬──┴──────┬──────────┬──────────┐
+   ▼         ▼         ▼          ▼          ▼
+ build     test      lint       gosec    trivy_fs   (all parallel from trigger)
+   │       │         │          │          │
+   │  docker build → trivy image scan (gate, HIGH/CRITICAL, .trivyignore for upstream noise)
+   │  → docker save → upload-artifact
+   │
+   └─────────┴─────────┴──────────┴──────────┘
                  ▼ (main + non-PR + production environment approval)
          ┌──────────────┐
-         │   publish    │  OIDC → ECR login → docker build/push → trivy image scan
+         │   publish    │  download-artifact → docker load
+         │              │  → OIDC → ECR login → docker tag + push (sha + latest)
          └──────┬───────┘
                 ▼
          ┌──────────────┐
          │    notify    │  Slack on success/failure (optional)
          └──────────────┘
 ```
+
+The image is built **once** in `build` and the same scanned bytes are promoted to ECR by `publish` via a workflow artifact — no rebuild in `publish`.
 
 ## Branches
 
@@ -41,12 +43,11 @@ The `legacy-keys` workflow lives at `examples/nobled-ci.legacy-keys.yml` on `mai
 
 - [docs/architecture.md](docs/architecture.md) — ASCII topology, job graph, concept-by-concept comparison vs the Jenkins repo
 - [docs/procedure.md](docs/procedure.md) — step-by-step walkthrough, prereqs through teardown
-- [docs/purposes.md](docs/purposes.md) — what each file/job is here for
 
 ## Reused from jenkins-cosmos-build
 
-- `docker/Dockerfile` — multistage `golang:1.24.13-bookworm` builder → `debian:bookworm-slim` runtime, non-root `cosmos` user, ports 26656/26657/1317/9090. Verbatim copy.
-- `scripts/noble-node-setup.sh` — bare-metal Noble `grand-1` node bootstrap, included for parity with the Jenkins repo so the image's deploy target is documented in-repo.
+- `docker/Dockerfile` — multistage `golang:1.24.13-bookworm` builder → `debian:bookworm-slim` runtime, non-root `cosmos` user, ports 26656/26657/1317/9090. Same pattern as the Jenkins repo, with `apt-get upgrade -y` added in both stages so the image picks up patched system packages at build time (clears Debian-layer CVEs reported by the Trivy image gate).
+- `scripts/noble-node-setup.sh` — bare-metal Noble `grand-1` testnet node bootstrap, included for parity with the Jenkins repo. The CI pipeline now builds `noble-1` mainnet images via `NOBLE_VERSION`; the script is kept as a reference for the testnet bootstrap path.
 
 ## AWS resources
 

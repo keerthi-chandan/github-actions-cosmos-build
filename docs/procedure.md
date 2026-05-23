@@ -227,8 +227,8 @@ Option B — manual trigger via UI:
 ### Watch the run
 
 1. Refresh the Actions tab. The new run appears at the top with a yellow "in progress" icon.
-2. Click into it. You'll see the job DAG — `build` running first, then `test`/`lint`/`gosec`/`trivy_fs` fanning out in parallel, then `publish`.
-3. When `publish` is reached, it pauses with an orange **"Waiting"** badge and a banner saying *"This workflow is awaiting deployment to production."*
+2. Click into it. You'll see the job DAG — `build`, `test`, `lint`, `gosec`, and `trivy_fs` all running in parallel from the start. `publish` waits for all five.
+3. The slow part is `build` (the Docker build of Noble — clone + `make install` inside the builder stage, ~3–5 minutes). When all five jobs finish, `publish` pauses with an orange **"Waiting"** badge and a banner saying *"This workflow is awaiting deployment to production."*
 
 ### Approve the deploy
 
@@ -236,7 +236,7 @@ Option B — manual trigger via UI:
 5. Check the **production** checkbox.
 6. (Optional) add a comment.
 7. Click **Approve and deploy**.
-8. The `publish` job starts. It'll take about 3-5 minutes (docker build of Noble is the slow part).
+8. The `publish` job starts. It's quick (~30–60 seconds) — it only downloads the image artifact, `docker load`s it, and pushes to ECR. There's no rebuild in `publish`.
 
 ### Verify the image landed in ECR
 
@@ -320,8 +320,9 @@ Then in GitHub:
 
 Check the Actions tab — a new run starts for the PR. Expected:
 
-- `build`, `test` (with the "skip on non-main" message), `lint`, `gosec`, `trivy_fs` all run.
+- `build`, `test` (with the "skip on non-main" message), `lint`, `gosec`, `trivy_fs` all run in parallel.
 - `publish` is **skipped** (you'll see it greyed out with a "Skipped" badge) because the workflow's `if:` condition gates it to main + non-PR.
+- `build` still produces the image artifact and runs the Trivy image scan as a gate — so PRs surface CVE regressions even though they never push to ECR.
 
 Close the PR without merging:
 
