@@ -8,8 +8,20 @@ name: nobled CI
 on:
   push:
     branches: [main, develop]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.github/workflows/noble-cd.yml'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.github/workflows/noble-cd.yml'
   workflow_dispatch:
   schedule:
     - cron: "0 2 * * *"
