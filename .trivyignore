@@ -1,0 +1,47 @@
+# Upstream Go-module CVEs in noble's go.mod that we can't patch without
+# forking noble. Each entry lists the vulnerable package, the installed
+# version, and the upstream fix version. Expiry triggers a re-triage —
+# by then noble (currently v11.4.0 / chain-id noble-1) may have bumped
+# these deps.
+
+# github.com/cometbft/cometbft v0.38.19 -> fixed in 0.38.21
+GHSA-c32p-wcqj-j677 exp:2026-08-21
+
+# github.com/dvsekhvalnov/jose2go v1.6.0 -> fixed in 1.7.0
+CVE-2025-63811 exp:2026-08-21
+
+# github.com/ethereum/go-ethereum v1.16.2 -> fixed in 1.16.8 / 1.16.9
+CVE-2026-22862 exp:2026-08-21
+CVE-2026-22868 exp:2026-08-21
+CVE-2026-26314 exp:2026-08-21
+
+# github.com/go-jose/go-jose/v4 v4.0.5 -> fixed in 4.1.4
+CVE-2026-34986 exp:2026-08-21
+
+# github.com/hashicorp/go-getter v1.7.5 -> fixed in 1.7.9 / 1.8.6
+CVE-2025-8959 exp:2026-08-21
+CVE-2026-4660 exp:2026-08-21
+
+# go.opentelemetry.io/otel v1.36.0 -> fixed in 1.41.0
+CVE-2026-29181 exp:2026-08-21
+
+# go.opentelemetry.io/otel/sdk v1.36.0 -> fixed in 1.40.0 / 1.43.0
+CVE-2026-24051 exp:2026-08-21
+CVE-2026-39883 exp:2026-08-21
+
+# google.golang.org/grpc v1.73.0 -> fixed in 1.79.3 (CRITICAL)
+CVE-2026-33186 exp:2026-08-21
+
+# Go stdlib CVEs (Go 1.24.13). Noble mainnet pins the toolchain to 1.24
+# for consensus-determinism reasons, so we cannot bump to the patched
+# 1.25.x / 1.26.x branches without forking noble.
+# stdlib v1.24.13 -> fixed in 1.25.8+ / 1.26.1+
+CVE-2026-25679 exp:2026-08-21
+CVE-2026-32280 exp:2026-08-21
+CVE-2026-32281 exp:2026-08-21
+CVE-2026-32283 exp:2026-08-21
+CVE-2026-33811 exp:2026-08-21
+CVE-2026-33814 exp:2026-08-21
+CVE-2026-39820 exp:2026-08-21
+CVE-2026-39836 exp:2026-08-21
+CVE-2026-42499 exp:2026-08-21
