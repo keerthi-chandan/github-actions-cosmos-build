@@ -6,7 +6,7 @@ name: nobled CD
 #   - workflow_dispatch: manual deploy of an arbitrary tag (rollback, hotfix).
 on:
   workflow_run:
-    workflows: ["nobled CI/CD"]
+    workflows: ["nobled CI"]
     types: [completed]
     branches: [main]
   workflow_dispatch:
