@@ -94,31 +94,55 @@ You should now see `token.actions.githubusercontent.com` in the Identity provide
 
 ## 5. AWS — create the IAM role for GitHub Actions
 
-Now we create a role that the GitHub Actions workflow can assume.
+Now we create a role that the GitHub Actions workflow can assume. We'll use the **Custom trust policy** flow instead of the **Web identity** wizard — the wizard generates a `StringLike` condition with an array of `repo:OWNER/REPO:ref:refs/heads/BRANCH` strings that's surprisingly fragile (the role assumption can fail with `Not authorized to perform sts:AssumeRoleWithWebIdentity` even when the policy looks correct). Pasting a hand-written wildcard policy avoids that whole class of issue and is the production-grade pattern anyway.
 
 1. Still in IAM, click **Roles** in the left sidebar.
 2. Click the **Create role** button (top right).
-3. **Trusted entity type**: choose **Web identity**.
-4. **Identity provider**: select `token.actions.githubusercontent.com` from the dropdown (it appears because we created it in step 4).
-5. **Audience**: select `sts.amazonaws.com` from the dropdown.
-6. **GitHub organization**: type `keerthi-chandan`.
-7. **GitHub repository** (optional but recommended): type `github-actions-cosmos-build`.
-8. **GitHub branch** (optional): type `main`. This locks the role to only the main branch — feature branches and forks can't assume it.
-9. Click **Next** (bottom right).
-10. **Permissions**: in the search box, type `AmazonEC2ContainerRegistryPowerUser` and check the checkbox next to it. This gives the role permission to push and pull from any ECR repo in your account.
-11. Click **Next**.
-12. **Role name**: `github-actions-nobled-ci`.
-13. **Description** (optional): `OIDC role for github-actions-cosmos-build workflow`.
-14. Scroll down and click **Create role**.
-15. You'll land back on the Roles list. Click into the `github-actions-nobled-ci` role you just created.
-16. At the top of the role's page, you'll see the **ARN** — it looks like `arn:aws:iam::720294271237:role/github-actions-nobled-ci`. Copy this ARN; you'll paste it into GitHub in the next step.
+3. **Trusted entity type**: choose **Custom trust policy**.
+4. In the JSON editor that appears, delete the placeholder and paste:
+
+    ```json
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Principal": {
+            "Federated": "arn:aws:iam::720294271237:oidc-provider/token.actions.githubusercontent.com"
+          },
+          "Action": "sts:AssumeRoleWithWebIdentity",
+          "Condition": {
+            "StringEquals": {
+              "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+            },
+            "StringLike": {
+              "token.actions.githubusercontent.com:sub": "repo:keerthi-chandan/github-actions-cosmos-build:*"
+            }
+          }
+        }
+      ]
+    }
+    ```
+
+    What this says: only JWTs signed by `token.actions.githubusercontent.com` (the GitHub Actions OIDC issuer) with audience `sts.amazonaws.com` and a subject under `repo:keerthi-chandan/github-actions-cosmos-build:*` may assume this role. The `*` after the repo allows any ref inside the repo — branches, tags, PRs, environments — but rejects every other repo or user on GitHub.
+
+5. Click **Next** (bottom right).
+6. **Permissions**: in the search box, type `AmazonEC2ContainerRegistryPowerUser` and check the checkbox next to it. This gives the role permission to push and pull from any ECR repo in your account.
+7. Click **Next**.
+8. **Role name**: `github-actions-nobled-ci`.
+9. **Description** (optional): `OIDC role for github-actions-cosmos-build workflow`.
+10. Scroll down and click **Create role**.
+11. You'll land back on the Roles list. Click into the `github-actions-nobled-ci` role you just created.
+12. At the top of the role's page, you'll see the **ARN** — it looks like `arn:aws:iam::720294271237:role/github-actions-nobled-ci`. Copy this ARN; you'll paste it into GitHub in the next step.
+
+> **Why not the Web identity wizard?** The wizard's UI for "GitHub branch" generates a trust policy with `StringLike` and an array containing an exact `:ref:refs/heads/main` string (sometimes duplicated). In practice this combination can return `Not authorized to perform sts:AssumeRoleWithWebIdentity` even when the JWT subject claim from the workflow exactly matches. Switching to a hand-written wildcard policy resolves it immediately and is what most production OIDC setups use anyway — you typically want CI to work from any branch, not just one.
 
 ### Add ECS deploy permissions to the role
 
 The ECR PowerUser policy covers the `publish` job (push image to ECR). The `noble-cd.yml` workflow also needs to update an ECS service — that's a separate, narrow set of permissions we attach as an inline policy.
 
-17. Still on the `github-actions-nobled-ci` role page, click **Add permissions** (the button is on the right above the policy list) → **Create inline policy**.
-18. Click the **JSON** tab and paste:
+13. Still on the `github-actions-nobled-ci` role page, click **Add permissions** (the button is on the right above the policy list) → **Create inline policy**.
+14. Click the **JSON** tab and paste:
 
     ```json
     {
@@ -154,7 +178,7 @@ The ECR PowerUser policy covers the `publish` job (push image to ECR). The `nobl
 
     Note: `DescribeTaskDefinition` and `RegisterTaskDefinition` don't support resource-level scoping (AWS limitation), so they use `Resource: "*"`. `UpdateService` is scoped to *only* the `nobled-smoke-service`. `iam:PassRole` is scoped to *only* the ECS task execution role — without this, ECS rejects the new task definition revision with "Unable to assume role."
 
-19. Click **Next** → **Policy name**: `github-actions-nobled-cd-ecs` → **Create policy**.
+15. Click **Next** → **Policy name**: `github-actions-nobled-cd-ecs` → **Create policy**.
 
 ## 6. GitHub — set the secret + variable
 
@@ -168,7 +192,7 @@ The workflow needs to know which IAM role to assume. We pass the ARN through Git
 
 4. Click the green **New repository secret** button.
 5. **Name**: `AWS_ROLE_ARN`.
-6. **Secret**: paste the role ARN you copied from step 5.16 (e.g., `arn:aws:iam::720294271237:role/github-actions-nobled-ci`).
+6. **Secret**: paste the role ARN you copied from step 5.12 (e.g., `arn:aws:iam::720294271237:role/github-actions-nobled-ci`).
 7. Click **Add secret**.
 
 ### Add the variable
@@ -253,9 +277,7 @@ Option B — manual trigger via UI:
 
 The CD workflow only *updates* an existing ECS service — it does not create the cluster, service, or task definition. §9.1–9.5 below walk through creating those resources in the console one time. After that, the workflow takes over.
 
-If you happen to already have these resources from another lab (e.g., the jenkins-cosmos-build portfolio repo uses the same names), you can skip §9.1–9.5 — the resource names match by design so a single ECS environment serves both pipelines. Otherwise, do every sub-step.
-
-You also need the inline IAM policy you attached in step 5 sub-steps 17-19 (`github-actions-nobled-cd-ecs`). Without it, the deploy job fails on `ecs:DescribeTaskDefinition` with `AccessDenied`.
+You also need the inline IAM policy you attached in step 5 sub-steps 13-15 (`github-actions-nobled-cd-ecs`). Without it, the deploy job fails on `ecs:DescribeTaskDefinition` with `AccessDenied`.
 
 ### 9.1 — CloudWatch log group (~2 min)
 
@@ -276,7 +298,7 @@ This role is what Fargate uses to pull from ECR and write to CloudWatch *before*
 3. **Trusted entity type**: **AWS service**.
 4. **Use case**: **Elastic Container Service** → select **Elastic Container Service Task** (NOT "EC2 Container Service") → click **Next**.
 5. **Permissions policies**: in the search box, type `AmazonECSTaskExecutionRolePolicy` and check it → **Next**.
-6. **Role name**: `ecsTaskExecutionRole` — use this exact name. The inline policy you attached in step 5.18 has `iam:PassRole` scoped to this exact ARN; renaming it will silently break the deploy job.
+6. **Role name**: `ecsTaskExecutionRole` — use this exact name. The inline policy you attached in step 5.14 has `iam:PassRole` scoped to this exact ARN; renaming it will silently break the deploy job.
 7. **Description** (optional): `Fargate execution role — pulls from ECR + writes CloudWatch logs`.
 8. Scroll down → **Create role**.
 
