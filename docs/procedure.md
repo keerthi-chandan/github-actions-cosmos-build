@@ -8,14 +8,14 @@ Sections:
 2. Create the GitHub repo
 3. First push (terminal)
 4. AWS — create the IAM OIDC provider
-5. AWS — create the IAM role for GitHub Actions
+5. AWS — create the IAM role for GitHub Actions (ECR push + ECS deploy)
 6. GitHub — set the secret + variable
 7. GitHub — configure the `production` environment
-8. First full run + approve the production deploy
-9. PR trigger test
-10. `workflow_dispatch` + scheduled cron
-11. Switch to the `legacy-keys` branch (static keys variant)
-12. Gotchas
+8. First full run + approve the production deploy (CI → ECR push)
+9. Verify the CD workflow (auto-deploy + manual rollback)
+10. PR trigger test
+11. `workflow_dispatch` + scheduled cron
+12. Switch to the `legacy-keys` branch (static keys variant)
 13. Teardown
 
 ---
@@ -110,6 +110,49 @@ Now we create a role that the GitHub Actions workflow can assume.
 15. You'll land back on the Roles list. Click into the `github-actions-nobled-ci` role you just created.
 16. At the top of the role's page, you'll see the **ARN** — it looks like `arn:aws:iam::720294271237:role/github-actions-nobled-ci`. Copy this ARN; you'll paste it into GitHub in the next step.
 
+### Add ECS deploy permissions to the role
+
+The ECR PowerUser policy covers the `publish` job (push image to ECR). The `noble-cd.yml` workflow also needs to update an ECS service — that's a separate, narrow set of permissions we attach as an inline policy.
+
+17. Still on the `github-actions-nobled-ci` role page, click **Add permissions** (the button is on the right above the policy list) → **Create inline policy**.
+18. Click the **JSON** tab and paste:
+
+    ```json
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Sid": "ECSTaskDefRegister",
+          "Effect": "Allow",
+          "Action": [
+            "ecs:DescribeTaskDefinition",
+            "ecs:RegisterTaskDefinition"
+          ],
+          "Resource": "*"
+        },
+        {
+          "Sid": "ECSServiceUpdate",
+          "Effect": "Allow",
+          "Action": [
+            "ecs:UpdateService",
+            "ecs:DescribeServices"
+          ],
+          "Resource": "arn:aws:ecs:us-east-1:720294271237:service/nobled-cluster/nobled-smoke-service"
+        },
+        {
+          "Sid": "PassExecutionRole",
+          "Effect": "Allow",
+          "Action": "iam:PassRole",
+          "Resource": "arn:aws:iam::720294271237:role/ecsTaskExecutionRole"
+        }
+      ]
+    }
+    ```
+
+    Note: `DescribeTaskDefinition` and `RegisterTaskDefinition` don't support resource-level scoping (AWS limitation), so they use `Resource: "*"`. `UpdateService` is scoped to *only* the `nobled-smoke-service`. `iam:PassRole` is scoped to *only* the ECS task execution role — without this, ECS rejects the new task definition revision with "Unable to assume role."
+
+19. Click **Next** → **Policy name**: `github-actions-nobled-cd-ecs` → **Create policy**.
+
 ## 6. GitHub — set the secret + variable
 
 The workflow needs to know which IAM role to assume. We pass the ARN through GitHub Secrets, and the AWS region through Variables.
@@ -201,7 +244,63 @@ Option B — manual trigger via UI:
 3. Click into the **cosmos/nobled** repository.
 4. On the **Images** tab, you'll see a new image tagged with the git commit SHA and `latest`, with the push time matching your run.
 
-## 9. PR trigger test
+## 9. Verify the CD workflow (auto-deploy + manual rollback)
+
+`.github/workflows/noble-cd.yml` is a second workflow file that handles the ECS Fargate rollout — the same deploy step that lived as the final stage of the jenkins-cosmos-build pipeline. It runs as a *downstream* workflow that fires after `nobled CI/CD` succeeds, so CI and CD are independently retriggerable.
+
+### Prereqs from jenkins-cosmos-build
+
+These ECS resources are assumed to already exist (you created them as part of jenkins-cosmos-build):
+
+- **ECS cluster**: `nobled-cluster`
+- **ECS service**: `nobled-smoke-service` (running task definition family `nobled-smoke`)
+- **Task execution role**: `ecsTaskExecutionRole`
+
+If you tore those down, recreate them from the jenkins-cosmos-build procedure before continuing. The CD workflow only *updates* the existing service — it does not create the cluster, service, or task definition.
+
+You also need the inline IAM policy you attached in step 5 sub-steps 17-19. Without it, the deploy job fails on `ecs:DescribeTaskDefinition` with `AccessDenied`.
+
+### Watch the auto-deploy
+
+Once the CI run from step 8 finishes successfully, GitHub fires a `workflow_run` event that triggers `nobled CD` automatically.
+
+1. Refresh the Actions tab. You'll see a new run for **nobled CD** appear at the top (separate from the `nobled CI/CD` run).
+2. Click into it. The `deploy` job starts, then pauses with the orange **"Waiting"** badge — the same `production` environment gate from step 7 applies here too.
+3. Click **Review deployments** → check **production** → **Approve and deploy**.
+4. Watch the `Deploy to ECS` step. You'll see the same log progression as the Jenkins ECS Deploy stage:
+
+    ```
+    ==> Reading current task def for nobled-smoke
+    ==> Patching image tag to 720294271237.dkr.ecr.us-east-1.amazonaws.com/cosmos/nobled:<sha>
+    ==> Registering new task definition revision
+        new revision: arn:aws:ecs:us-east-1:720294271237:task-definition/nobled-smoke:<N>
+    ==> Updating nobled-smoke-service
+    ==> Waiting for services-stable (fails if rollout doesn't succeed)
+    ==> Rollout complete
+    ```
+
+5. The `notify` job then posts to Slack (if `SLACK_WEBHOOK_URL` is configured) with `:rocket: nobled <sha7> deployed to nobled-smoke-service`.
+
+### Verify the rollout in AWS
+
+1. AWS Console → search **ECS** → **Clusters** → click `nobled-cluster`.
+2. **Services** tab → click `nobled-smoke-service`.
+3. **Deployments** tab — the latest deployment shows status `PRIMARY` with the new task definition revision number, and the image field matches `cosmos/nobled:<your-commit-sha>`.
+4. **Tasks** tab — the running task should be on the new revision, in `RUNNING` state with `HealthStatus: HEALTHY`.
+
+### Manual deploy / rollback
+
+If a deploy goes bad and you want to roll back to an older image without re-running CI:
+
+1. Actions tab → **nobled CD** in the left sidebar.
+2. Click the **Run workflow** dropdown (top right of the run list).
+3. **image_tag** input: paste a previous commit SHA (40 chars from `git log`), or type `latest` to redeploy the current `latest` tag.
+4. Click the green **Run workflow** button.
+5. Approve at the production gate as usual.
+
+Every CI publish tags the image with the commit SHA, so any historical build can be redeployed by SHA. This is the rollback path — no need to revert commits or re-trigger CI.
+
+## 10. PR trigger test
 
 This verifies that pull requests run CI but don't push to ECR.
 
@@ -229,7 +328,7 @@ Close the PR without merging:
 2. Click **Close pull request**.
 3. Click **Delete branch** (the button appears after closing).
 
-## 10. `workflow_dispatch` + scheduled cron
+## 11. `workflow_dispatch` + scheduled cron
 
 `workflow_dispatch` was tested in step 8 (Option B). The cron `0 2 * * *` fires nightly at 2 AM UTC — you don't need to do anything to test it, it'll just appear in the Actions tab tomorrow morning. If you want to confirm it's registered:
 
@@ -237,7 +336,7 @@ Close the PR without merging:
 2. Above the run list, you'll see **"This workflow has a `workflow_dispatch` event trigger"** badge if the file is parsed correctly.
 3. (There's no UI badge for cron, but if the workflow file parses, the cron is registered.)
 
-## 11. Switch to the `legacy-keys` branch (static keys variant)
+## 12. Switch to the `legacy-keys` branch (static keys variant)
 
 This branch shows what the workflow looks like with traditional access keys instead of OIDC. We're doing it for educational comparison, not to actually use long-term.
 
@@ -288,22 +387,6 @@ git push -u origin legacy-keys
 The push triggers a workflow run on the `legacy-keys` branch. On this branch, `publish` is still gated to `main` only, so it won't push to ECR — but you can see in the run that `build`, `test` (skipped), `lint`, `gosec`, `trivy_fs` all run with the static-keys workflow file.
 
 If you want to *actually* exercise the access-keys publish, you'd merge `legacy-keys` to `main`. Don't do that in this scaffold — the point is to view the two workflow files side-by-side in the repo.
-
-## 12. Gotchas
-
-Things that have bitten people (or are likely to). Numbered like jenkins-cosmos-build's Gx series.
-
-- **G1 — OIDC `sub` claim mismatch.** If you typed the GitHub org/repo/branch fields wrong in step 5, the workflow's OIDC token won't match what the role's trust policy expects, and AWS rejects it with "Not authorized to perform `sts:AssumeRoleWithWebIdentity`." Fix: in IAM → Roles → `github-actions-nobled-ci` → Trust relationships, verify the `sub` claim matches `repo:keerthi-chandan/github-actions-cosmos-build:ref:refs/heads/main`.
-
-- **G2 — `id-token: write` is per-job, not workflow-wide.** The workflow-level `permissions: contents: read` is read-only. The `publish` job adds `id-token: write` specifically so it can request an OIDC token. If you ever copy this workflow to a new repo and forget that per-job permission block, AWS auth will fail with "Could not retrieve ID token."
-
-- **G3 — Secrets aren't passed to fork PRs.** GitHub deliberately blocks fork PRs from accessing secrets. If anyone forks your repo and opens a PR, `secrets.AWS_ROLE_ARN` will be empty inside that run. Our workflow's `publish` job is already gated against PRs, so this isn't a problem — but be aware if you ever lift that gate.
-
-- **G4 — Every parallel job re-clones Noble.** Hosted runners are isolated VMs with no shared filesystem, so `test`/`lint`/`gosec`/`trivy_fs` each clone Noble independently. Total clone cost ≈ 4× a single clone. For a small repo this is fine; for a large repo you'd consolidate into one job.
-
-- **G5 — `environment: production` blocks indefinitely.** If you set required reviewers and forget to approve, the run sits in "Waiting for review" forever (well, up to 30 days, then GitHub auto-cancels). If you're going on vacation, either disable the cron or remove yourself as the sole reviewer and add a co-reviewer.
-
-- **G6 — Cold cache on first build.** The very first `build` job runs with empty Go module + build caches, so it has to download all of Noble's transitive Go dependencies. That can take 5-8 minutes. The second build (with warm cache) is much faster, often 2-3 minutes. Don't panic on the first run's slow build.
 
 ## 13. Teardown
 

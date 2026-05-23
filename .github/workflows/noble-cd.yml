@@ -1,0 +1,152 @@
+name: nobled CD
+
+# Triggers
+#   - workflow_run: auto-deploy after `nobled CI/CD` succeeds on main.
+#     The image at ${github.sha} is what the upstream `publish` job just pushed.
+#   - workflow_dispatch: manual deploy of an arbitrary tag (rollback, hotfix).
+on:
+  workflow_run:
+    workflows: ["nobled CI/CD"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "ECR image tag to deploy (commit SHA or 'latest')"
+        required: true
+        default: "latest"
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: cosmos/nobled
+  ECS_CLUSTER: nobled-cluster
+  ECS_SERVICE: nobled-smoke-service
+  ECS_TASK_FAMILY: nobled-smoke
+
+# Read-only by default; the deploy job widens to id-token: write for OIDC.
+permissions:
+  contents: read
+
+# Only one deploy at a time — never overlap rollouts.
+concurrency:
+  group: nobled-cd
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: ECS Fargate deploy
+    runs-on: ubuntu-latest
+    # For workflow_run, only deploy if upstream CI succeeded. workflow_dispatch always runs.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+    steps:
+      - name: Resolve image tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "image_tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "image_tag=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: github-actions-nobled-cd-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Deploy to ECS
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.tag.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          IMAGE_REMOTE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+          echo "==> Reading current task def for ${ECS_TASK_FAMILY}"
+          aws ecs describe-task-definition \
+            --task-definition "${ECS_TASK_FAMILY}" \
+            --region "${AWS_REGION}" \
+            --query 'taskDefinition' \
+            --output json > current-task-def.json
+
+          echo "==> Patching image tag to ${IMAGE_REMOTE}"
+          jq --arg IMG "${IMAGE_REMOTE}" '
+            .containerDefinitions[0].image = $IMG
+            | del(.taskDefinitionArn, .revision, .status,
+                  .requiresAttributes, .compatibilities,
+                  .registeredAt, .registeredBy)
+          ' current-task-def.json > new-task-def.json
+
+          echo "==> Registering new task definition revision"
+          NEW_ARN=$(aws ecs register-task-definition \
+            --region "${AWS_REGION}" \
+            --cli-input-json file://new-task-def.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "    new revision: ${NEW_ARN}"
+
+          echo "==> Updating ${ECS_SERVICE}"
+          aws ecs update-service \
+            --cluster "${ECS_CLUSTER}" \
+            --service "${ECS_SERVICE}" \
+            --task-definition "${NEW_ARN}" \
+            --region "${AWS_REGION}" > /dev/null
+
+          echo "==> Waiting for services-stable (fails if rollout doesn't succeed)"
+          aws ecs wait services-stable \
+            --cluster "${ECS_CLUSTER}" \
+            --services "${ECS_SERVICE}" \
+            --region "${AWS_REGION}"
+
+          echo "==> Rollout complete"
+          rm -f current-task-def.json new-task-def.json
+
+  notify:
+    name: Slack notify
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: always() && needs.deploy.result != 'skipped'
+    steps:
+      - name: Slack success
+        if: needs.deploy.result == 'success'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          IMAGE_TAG: ${{ needs.deploy.outputs.image_tag }}
+        run: |
+          if [ -z "${SLACK_WEBHOOK_URL}" ]; then
+            echo "SLACK_WEBHOOK_URL not set; skipping notify"
+            exit 0
+          fi
+          SHORT_TAG="${IMAGE_TAG:0:7}"
+          curl -sS -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\":rocket: nobled ${SHORT_TAG} deployed to ${ECS_SERVICE}\"}" \
+            "${SLACK_WEBHOOK_URL}"
+
+      - name: Slack failure
+        if: needs.deploy.result == 'failure'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          IMAGE_TAG: ${{ needs.deploy.outputs.image_tag }}
+        run: |
+          if [ -z "${SLACK_WEBHOOK_URL}" ]; then
+            echo "SLACK_WEBHOOK_URL not set; skipping notify"
+            exit 0
+          fi
+          SHORT_TAG="${IMAGE_TAG:0:7}"
+          curl -sS -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\":x: nobled ${SHORT_TAG} deploy failed — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "${SLACK_WEBHOOK_URL}"

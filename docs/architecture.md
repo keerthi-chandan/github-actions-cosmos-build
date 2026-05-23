@@ -1,6 +1,11 @@
 # Architecture
 
-This pipeline takes the Noble testnet node source from GitHub, builds it, scans it, packages it into a Docker image, and pushes that image to AWS ECR. Every step runs on GitHub Actions — you don't manage any servers.
+This pipeline takes the Noble testnet node source from GitHub, builds it, scans it, packages it into a Docker image, pushes that image to AWS ECR, and then rolls out the new image to an ECS Fargate service. Every step runs on GitHub Actions — you don't manage any servers.
+
+Two workflow files split the work along the CI/CD boundary:
+
+- **`.github/workflows/nobled-ci.yml`** — build, test, scan, push image to ECR.
+- **`.github/workflows/noble-cd.yml`** — downstream deploy to ECS Fargate, triggered by the CI workflow finishing successfully (or manually for rollback).
 
 ## Topology
 
@@ -15,6 +20,7 @@ This pipeline takes the Noble testnet node source from GitHub, builds it, scans 
                              │ each job gets its own
                              │ fresh ubuntu-latest VM
                              ▼
+   nobled CI/CD (.github/workflows/nobled-ci.yml)
                          ┌───────┐
                          │ build │  clone noble → make install → upload nobled
                          └───┬───┘
@@ -29,13 +35,32 @@ This pipeline takes the Noble testnet node source from GitHub, builds it, scans 
                        └─────┬─────┘
                              ▼
                         ┌────────┐
-                        │ notify │  Slack message (success / failure)
-                        └────────┘
+                        │ notify │  Slack: image pushed (success / failure)
+                        └────┬───┘
                              │
+                             │  AWS ECR (image now available)
+                             │  720294271237.dkr.ecr.us-east-1.amazonaws.com/cosmos/nobled
+                             │  (shared with jenkins-cosmos-build)
+                             │
+                             │  workflow_run: completed
+                             │  (fires only if upstream conclusion == 'success')
                              ▼
-   AWS ECR: 720294271237.dkr.ecr.us-east-1.amazonaws.com/cosmos/nobled
-   (shared with jenkins-cosmos-build)
+   nobled CD (.github/workflows/noble-cd.yml)
+                       ┌────────┐
+                       │ deploy │  OIDC → describe task def → patch image tag (jq)
+                       │        │  → register new revision → update-service
+                       │        │  → wait services-stable
+                       └────┬───┘
+                             ▼  "production" approved (same gate as CI publish)
+                        ┌────────┐
+                        │ notify │  Slack: deploy result (success / failure)
+                        └────┬───┘
+                             ▼
+   AWS ECS Fargate: nobled-cluster / nobled-smoke-service
+   (running task def nobled-smoke at the new revision)
 ```
+
+`workflow_dispatch` on the CD side enters at `deploy` independently — the manual rollback path that bypasses CI entirely.
 
 ## What each job does
 
@@ -46,8 +71,10 @@ This pipeline takes the Noble testnet node source from GitHub, builds it, scans 
 | `lint` | Runs `golangci-lint` over the Noble source. Report-only: failures don't block the pipeline, because Noble is upstream code we don't own and can't fix from here. | Every run. |
 | `gosec` | Runs the `gosec` security scanner over the Noble source. Uploads its findings as a SARIF file (a standard scan-result format). | Every run. |
 | `trivy_fs` | Runs Trivy filesystem scan, which looks for known vulnerable dependencies in `go.sum` and similar files. Uploads its JSON report. | Every run. |
-| `publish` | This is the deploy step. Builds the Docker image from `docker/Dockerfile`, tags it with the git commit SHA and `latest`, pushes both tags to AWS ECR, then runs Trivy against the just-pushed image. **Only runs on `main` branch and only on non-PR events**, and waits for manual approval if you set up the production environment with required reviewers. | Gated. |
-| `notify` | Posts a Slack message saying whether the publish succeeded or failed. If you didn't set up a Slack webhook, this job runs but does nothing. | After publish. |
+| `publish` | Builds the Docker image from `docker/Dockerfile`, tags it with the git commit SHA and `latest`, pushes both tags to AWS ECR, then runs Trivy against the just-pushed image. **Only runs on `main` branch and only on non-PR events**, and waits for manual approval if you set up the production environment with required reviewers. | Gated. |
+| `notify` (CI) | Posts a Slack message saying whether the publish succeeded or failed. If you didn't set up a Slack webhook, this job runs but does nothing. | After publish. |
+| `deploy` (CD) | Lives in `noble-cd.yml`. After CI succeeds on main, fetches the live ECS task definition, patches in the new image tag with `jq`, registers a new task definition revision, calls `update-service` on `nobled-smoke-service`, and `aws ecs wait services-stable` blocks until the rollout succeeds. Also runnable manually via `workflow_dispatch` for rollback to any prior SHA. | After CI / manual. |
+| `notify` (CD) | Slack message with the deploy result and the deployed image tag. Same skip-on-missing-webhook behavior as the CI notify. | After deploy. |
 
 ## Why OIDC (and not access keys)
 
