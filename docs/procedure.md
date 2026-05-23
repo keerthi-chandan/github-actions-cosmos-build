@@ -14,9 +14,10 @@ Sections:
 8. First full run + approve the production deploy (CI → ECR push)
 9. Verify the CD workflow (auto-deploy + manual rollback)
 10. PR trigger test
-11. `workflow_dispatch` + scheduled cron
-12. Switch to the `legacy-keys` branch (static keys variant)
-13. Teardown
+11. Verify the `paths-ignore` filter (docs/CD skip CI)
+12. `workflow_dispatch` + scheduled cron
+13. Switch to the `legacy-keys` branch (static keys variant)
+14. Teardown
 
 ---
 
@@ -328,7 +329,46 @@ Close the PR without merging:
 2. Click **Close pull request**.
 3. Click **Delete branch** (the button appears after closing).
 
-## 11. `workflow_dispatch` + scheduled cron
+## 11. Verify the `paths-ignore` filter (docs/CD skip CI)
+
+The CI workflow has a `paths-ignore:` block on both `push` and `pull_request` triggers (see tutorial §4.2). Patterns ignored: `**.md`, `docs/**`, `LICENSE`, `.gitignore`, `.github/workflows/noble-cd.yml`. A push that touches **only** ignored files should produce no CI run.
+
+### Test 1 — docs-only push should skip CI
+
+```bash
+cd ~/Desktop/devops/github-actions-cosmos-build
+echo "" >> README.md
+git commit -am "docs: nudge README to test paths-ignore"
+git push
+```
+
+Then in GitHub:
+
+1. Go to the Actions tab.
+2. Confirm that **no new run appears** for `nobled CI/CD` for that commit. The commit itself shows up in the repo's commit list (with no status check icon), but the Actions tab is unchanged.
+
+### Test 2 — mixed push should still run CI
+
+If you change a code file in the same commit as a doc file, CI fires as normal — the filter only skips when *every* changed file matches an ignored pattern.
+
+```bash
+echo "// nudge" >> docker/Dockerfile  # any non-ignored file works
+echo "" >> README.md
+git commit -am "mixed: code + doc change"
+git push
+```
+
+This time a new `nobled CI/CD` run appears — `paths-ignore` doesn't apply because `docker/Dockerfile` is outside the ignore list.
+
+### Test 3 — CD-only edit should skip CI but trigger CD
+
+The CI workflow ignores `.github/workflows/noble-cd.yml`. So editing only the CD file does **not** trigger CI, and (because CD itself is triggered via `workflow_run` on CI success) the CD workflow also does not auto-fire from this push alone. The CD workflow on this branch is reachable only via the next CI success or via manual `workflow_dispatch` from the Actions tab.
+
+### When to update the filter
+
+Add to `paths-ignore:` when you find yourself routinely pushing files that don't need CI (new doc directories, IDE config files, etc.). Remove patterns if you ever start running code from a path that's currently ignored — e.g., if `docs/` ever holds generated/executable content.
+
+## 12. `workflow_dispatch` + scheduled cron
 
 `workflow_dispatch` was tested in step 8 (Option B). The cron `0 2 * * *` fires nightly at 2 AM UTC — you don't need to do anything to test it, it'll just appear in the Actions tab tomorrow morning. If you want to confirm it's registered:
 
@@ -336,7 +376,7 @@ Close the PR without merging:
 2. Above the run list, you'll see **"This workflow has a `workflow_dispatch` event trigger"** badge if the file is parsed correctly.
 3. (There's no UI badge for cron, but if the workflow file parses, the cron is registered.)
 
-## 12. Switch to the `legacy-keys` branch (static keys variant)
+## 13. Switch to the `legacy-keys` branch (static keys variant)
 
 This branch shows what the workflow looks like with traditional access keys instead of OIDC. We're doing it for educational comparison, not to actually use long-term.
 
@@ -388,7 +428,7 @@ The push triggers a workflow run on the `legacy-keys` branch. On this branch, `p
 
 If you want to *actually* exercise the access-keys publish, you'd merge `legacy-keys` to `main`. Don't do that in this scaffold — the point is to view the two workflow files side-by-side in the repo.
 
-## 13. Teardown
+## 14. Teardown
 
 If you want to fully clean up the AWS side of this lab (the GitHub repo itself costs nothing while idle — keep it for the portfolio).
 
@@ -398,7 +438,7 @@ If you want to fully clean up the AWS side of this lab (the GitHub repo itself c
 2. Search for `github-actions-nobled-ci` and check the checkbox.
 3. Click **Delete** (top right) → type the role name to confirm → **Delete**.
 
-### Delete the legacy IAM user (UI, only if you did step 11)
+### Delete the legacy IAM user (UI, only if you did step 13)
 
 1. AWS Console → IAM → Users.
 2. Click into `github-actions-legacy`.
